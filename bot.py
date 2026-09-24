@@ -5,7 +5,7 @@ import re
 import discord
 from discord import app_commands
 
-BOT_VERSION = "vc-panel v3 (テキストパネル版)"
+BOT_VERSION = "vc-panel v4 (コマンド自動削除)"
 TOKEN = os.environ["DISCORD_TOKEN"]
 TRIGGER_CHANNEL_ID = int(os.environ["TRIGGER_CHANNEL_ID"])  # 「ボイスを作成」VCのID
 
@@ -269,13 +269,16 @@ class VCPanelView(discord.ui.View):
 
 # ===================== Bot本体 =====================
 class VCBot(discord.Client):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tree = app_commands.CommandTree(self)
+        self.commands_cleared = False
+
     async def setup_hook(self):
         self.add_view(VCPanelView())  # 再起動後もパネルのボタンが動くように
 
 
 client = VCBot(intents=intents)
-tree = app_commands.CommandTree(client)  # 古い/コマンドの削除用
-commands_cleared = False
 
 
 @client.event
@@ -286,14 +289,15 @@ async def on_ready():
         print("TRIGGER_CHANNEL_ID のチャンネルが見つかりません")
         return
 
-    # 環境変数 CLEAR_COMMANDS=1 のときだけ、登録済みの/コマンドを全部消す
-    global commands_cleared
-    if os.environ.get("CLEAR_COMMANDS") == "1" and not commands_cleared:
-        tree.clear_commands(guild=trigger.guild)
-        await tree.sync(guild=trigger.guild)
-        await tree.sync()
-        commands_cleared = True
-        print("/コマンドを削除しました。CLEAR_COMMANDS は消してOKです")
+    # 前のバージョンで登録された /コマンド を全部消す(このBotはコマンドを使わない)
+    if not client.commands_cleared:
+        client.tree.clear_commands(guild=trigger.guild)
+        await client.tree.sync(guild=trigger.guild)
+        await client.tree.sync()
+        client.commands_cleared = True
+        print("スラッシュコマンドを削除しました")
+
+
     # 再起動前に作られたVCを整理
     for ch in trigger.guild.voice_channels:
         if ch.id != TRIGGER_CHANNEL_ID and ch.category == trigger.category and NAME_RE.match(ch.name):
