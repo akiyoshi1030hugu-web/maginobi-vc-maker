@@ -3,7 +3,9 @@ import os
 import re
 
 import discord
+from discord import app_commands
 
+BOT_VERSION = "vc-panel v3 (テキストパネル版)"
 TOKEN = os.environ["DISCORD_TOKEN"]
 TRIGGER_CHANNEL_ID = int(os.environ["TRIGGER_CHANNEL_ID"])  # 「ボイスを作成」VCのID
 
@@ -31,34 +33,36 @@ def next_number(category_channels) -> int:
 
 
 # ===================== VCコントロールパネル =====================
-OWNER_RE = re.compile(r"オーナーID: (\d+)")
+OWNER_RE = re.compile(r"<@!?(\d+)>")  # 本文の最初のメンション = オーナー
 
 
-def panel_embed(owner_id: int, locked: bool = False) -> discord.Embed:
-    e = discord.Embed(
-        title="🎛 VCコントロールパネル",
-        description=f"オーナー: <@{owner_id}>\n操作できるのはオーナーだけです。\n"
-                    "オーナーがいなくなったら、VCにいる人が🙋で引き継げます。",
-        color=discord.Color.blurple(),
+def panel_text(owner_id: int, locked: bool = False) -> str:
+    """パネル本文。埋め込みを使わないので「埋め込みリンク」権限がなくても動く"""
+    return (
+        f"🎛 **VCコントロールパネル**\n"
+        f"オーナー: <@{owner_id}>\n"
+        f"状態: {'🔒 ロック中' if locked else '🔓 開放中'}\n"
+        "-# 操作できるのはオーナーだけ。オーナーがいなくなったら🙋で引き継げます"
     )
-    e.add_field(name="状態", value="🔒 ロック中" if locked else "🔓 開放中")
-    e.set_footer(text=f"オーナーID: {owner_id}")
-    return e
 
 
-def parse_panel(message: discord.Message) -> tuple[int, bool]:
-    e = message.embeds[0]
-    owner_id = int(OWNER_RE.search(e.footer.text or "")[1])
-    locked = "ロック中" in e.fields[0].value
-    return owner_id, locked
+def parse_panel(message: discord.Message) -> tuple[int, bool] | None:
+    """パネルからオーナーとロック状態を読む(読めなければ None)"""
+    text = message.content or ""
+    if message.embeds:  # 旧バージョンの埋め込みパネルにも対応
+        e = message.embeds[0]
+        text += " " + (e.description or "") + " " + " ".join(f.value for f in e.fields)
+    m = OWNER_RE.search(text)
+    if not m:
+        return None
+    return int(m[1]), "ロック中" in text
 
 
 async def send_panel(vc: discord.VoiceChannel, owner_id: int):
     """VCのテキストチャットにパネルを出す"""
     try:
         msg = await vc.send(
-            f"<@{owner_id}> VCの設定はここからできます",
-            embed=panel_embed(owner_id),
+            panel_text(owner_id),
             view=VCPanelView(),
             allowed_mentions=discord.AllowedMentions(users=True),
         )
@@ -69,8 +73,9 @@ async def send_panel(vc: discord.VoiceChannel, owner_id: int):
 
 
 async def set_owner(vc: discord.VoiceChannel, panel: discord.Message, new_owner: discord.Member):
-    _, locked = parse_panel(panel)
-    await panel.edit(embed=panel_embed(new_owner.id, locked))
+    parsed = parse_panel(panel)
+    locked = parsed[1] if parsed else False
+    await panel.edit(content=panel_text(new_owner.id, locked), embed=None)
     vc_owners[vc.id] = new_owner.id
     vc_panels[vc.id] = panel.id
     if locked:  # ロック中でも新オーナーが入れるように
@@ -147,8 +152,8 @@ class MemberSelectView(discord.ui.View):
             return await interaction.response.edit_message(content="その人はもうVCにいません", view=None)
         if self.action == "kick":
             await target.move_to(None, reason=f"{interaction.user} がキック")
-            _, locked = parse_panel(self.panel)
-            if locked:  # ロック中なら個別の接続許可を消して戻れなくする
+            parsed = parse_panel(self.panel)
+            if parsed and parsed[1]:  # ロック中なら個別の接続許可を消して戻れなくする
                 await self.vc.set_permissions(target, overwrite=None)
             await interaction.response.edit_message(content=f"{target.display_name} を切断しました", view=None)
         else:
@@ -160,12 +165,28 @@ class VCPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        """エラーが起きても「応答しませんでした」にしない"""
+        print(f"[panel error] {item.label}: {error!r}")
+        msg = f"エラーが起きました: {type(error).__name__}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     async def check(self, interaction: discord.Interaction, owner_only: bool = True):
         vc = interaction.channel
         if not isinstance(vc, discord.VoiceChannel) or vc.id not in temp_channels:
             await interaction.response.send_message("このパネルはもう使えません", ephemeral=True)
             return None
-        owner_id, locked = parse_panel(interaction.message)
+        parsed = parse_panel(interaction.message)
+        if parsed is None:
+            await interaction.response.send_message("パネルを読み取れませんでした。VCを作り直してください", ephemeral=True)
+            return None
+        owner_id, locked = parsed
         # 再起動後もパネルから状態を復元
         vc_owners[vc.id] = owner_id
         vc_panels[vc.id] = interaction.message.id
@@ -198,7 +219,7 @@ class VCPanelView(discord.ui.View):
                 await lock_vc(vc, owner_id)
         except discord.Forbidden:
             return await interaction.followup.send("Botに「ロールの管理」権限が必要です", ephemeral=True)
-        await interaction.message.edit(embed=panel_embed(owner_id, not locked))
+        await interaction.message.edit(content=panel_text(owner_id, not locked), embed=None)
         await interaction.followup.send("🔓 ロックを解除しました" if locked else "🔒 ロックしました(今いる人だけ入れます)",
                                         ephemeral=True)
 
@@ -253,15 +274,26 @@ class VCBot(discord.Client):
 
 
 client = VCBot(intents=intents)
+tree = app_commands.CommandTree(client)  # 古い/コマンドの削除用
+commands_cleared = False
 
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
+    print(f"Logged in as {client.user} / {BOT_VERSION}")
     trigger = client.get_channel(TRIGGER_CHANNEL_ID)
     if trigger is None:
         print("TRIGGER_CHANNEL_ID のチャンネルが見つかりません")
         return
+
+    # 環境変数 CLEAR_COMMANDS=1 のときだけ、登録済みの/コマンドを全部消す
+    global commands_cleared
+    if os.environ.get("CLEAR_COMMANDS") == "1" and not commands_cleared:
+        tree.clear_commands(guild=trigger.guild)
+        await tree.sync(guild=trigger.guild)
+        await tree.sync()
+        commands_cleared = True
+        print("/コマンドを削除しました。CLEAR_COMMANDS は消してOKです")
     # 再起動前に作られたVCを整理
     for ch in trigger.guild.voice_channels:
         if ch.id != TRIGGER_CHANNEL_ID and ch.category == trigger.category and NAME_RE.match(ch.name):
